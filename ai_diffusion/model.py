@@ -20,7 +20,7 @@ from .util import clamp, ensure, trim_text, client_logger as log
 from .settings import ApplyBehavior, settings
 from .network import NetworkError
 from .image import Extent, Image, Mask, Bounds, DummyImage
-from .client import ClientMessage, ClientEvent, ClientOutput
+from .client import Client, ClientMessage, ClientEvent, ClientOutput
 from .client import filter_supported_styles, resolve_arch
 from .custom_workflow import CustomWorkspace, WorkflowCollection, CustomGenerationMode
 from .document import Document, KritaDocument
@@ -83,6 +83,7 @@ class Model(QObject, ObservableProperties):
     batch_count = Property(1, persist=True)
     seed = Property(0, persist=True)
     fixed_seed = Property(False, persist=True)
+    resolution_multiplier = Property(1.0, persist=True)
     queue_front = Property(False, persist=True)
     translation_enabled = Property(True, persist=True)
     progress_kind = Property(ProgressKind.generation)
@@ -96,6 +97,7 @@ class Model(QObject, ObservableProperties):
     batch_count_changed = pyqtSignal(int)
     seed_changed = pyqtSignal(int)
     fixed_seed_changed = pyqtSignal(bool)
+    resolution_multiplier_changed = pyqtSignal(float)
     queue_front_changed = pyqtSignal(bool)
     translation_enabled_changed = pyqtSignal(bool)
     progress_kind_changed = pyqtSignal(ProgressKind)
@@ -210,7 +212,7 @@ class Model(QObject, ObservableProperties):
             self.seed if self.fixed_seed else workflow.generate_seed(),
             client.models,
             FileLibrary.instance(),
-            client.performance_settings,
+            self._performance_settings(client),
             mask=mask,
             strength=self.strength,
             inpaint=inpaint,
@@ -272,7 +274,7 @@ class Model(QObject, ObservableProperties):
                 params.seed,
                 client.models,
                 FileLibrary.instance(),
-                client.performance_settings,
+                self._performance_settings(client),
                 strength=params.strength,
                 upscale_factor=params.factor,
                 upscale=params.upscale,
@@ -294,10 +296,11 @@ class Model(QObject, ObservableProperties):
             return
 
         self.clear_error()
+        self.upscale.set_in_progress(True)
+
         eventloop.run(_report_errors(self, self._enqueue_job(job, inputs)))
 
         self._doc.resize(job.params.bounds.extent)
-        self.upscale.set_in_progress(True)
         self.upscale.target_extent_changed.emit(self.upscale.target_extent)
 
     def estimate_cost(self, kind=JobKind.diffusion):
@@ -359,7 +362,7 @@ class Model(QObject, ObservableProperties):
             self.seed,
             client.models,
             FileLibrary.instance(),
-            client.performance_settings,
+            self._performance_settings(client),
             mask=mask,
             strength=self.live.strength,
             inpaint=inpaint if mask else None,
@@ -437,7 +440,7 @@ class Model(QObject, ObservableProperties):
             image = self._doc.get_image(Bounds(0, 0, *self._doc.extent))
             mask, _ = self.document.create_mask_from_selection(padding=0.25, multiple=64)
             bounds = mask.bounds if mask else None
-            perf = self._connection.client.performance_settings
+            perf = self._performance_settings(self._connection.client)
             input = workflow.prepare_create_control_image(image, control.mode, perf, bounds)
             job = self.jobs.add_control(control, Bounds(0, 0, *image.extent))
         except Exception as e:
@@ -715,6 +718,12 @@ class Model(QObject, ObservableProperties):
             return InpaintMode.fill
         return self.inpaint.mode
 
+    def _performance_settings(self, client: Client):
+        result = client.performance_settings
+        if self.resolution_multiplier != 1.0:
+            result.resolution_multiplier = self.resolution_multiplier
+        return result
+
     @property
     def prompt_translation_language(self):
         return settings.prompt_translation if self.translation_enabled else ""
@@ -858,7 +867,7 @@ class UpscaleWorkspace(QObject, ObservableProperties):
             self._update_can_generate()
 
     def _update_can_generate(self):
-        self.can_generate = not self._in_progress and (self.factor > 1.0 or self.use_diffusion)
+        self.can_generate = not self._in_progress
 
     @property
     def target_extent(self):
@@ -1118,7 +1127,7 @@ class AnimationWorkspace(QObject, ObservableProperties):
             conditioning,
             style=m.style,
             seed=seed,
-            perf=m._connection.client.performance_settings,
+            perf=m._performance_settings(m._connection.client),
             models=m._connection.client.models,
             files=FileLibrary.instance(),
             strength=m.strength,
