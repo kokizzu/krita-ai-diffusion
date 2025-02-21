@@ -20,7 +20,7 @@ from .util import clamp, ensure, trim_text, client_logger as log
 from .settings import ApplyBehavior, settings
 from .network import NetworkError
 from .image import Extent, Image, Mask, Bounds, DummyImage
-from .client import ClientMessage, ClientEvent, ClientOutput
+from .client import Client, ClientMessage, ClientEvent, ClientOutput
 from .client import filter_supported_styles, resolve_arch
 from .custom_workflow import CustomWorkspace, WorkflowCollection, CustomGenerationMode
 from .document import Document, KritaDocument
@@ -83,6 +83,7 @@ class Model(QObject, ObservableProperties):
     batch_count = Property(1, persist=True)
     seed = Property(0, persist=True)
     fixed_seed = Property(False, persist=True)
+    resolution_multiplier = Property(1.0, persist=True)
     queue_front = Property(False, persist=True)
     translation_enabled = Property(True, persist=True)
     progress_kind = Property(ProgressKind.generation)
@@ -96,6 +97,7 @@ class Model(QObject, ObservableProperties):
     batch_count_changed = pyqtSignal(int)
     seed_changed = pyqtSignal(int)
     fixed_seed_changed = pyqtSignal(bool)
+    resolution_multiplier_changed = pyqtSignal(float)
     queue_front_changed = pyqtSignal(bool)
     translation_enabled_changed = pyqtSignal(bool)
     progress_kind_changed = pyqtSignal(ProgressKind)
@@ -210,7 +212,7 @@ class Model(QObject, ObservableProperties):
             self.seed if self.fixed_seed else workflow.generate_seed(),
             client.models,
             FileLibrary.instance(),
-            client.performance_settings,
+            self._performance_settings(client),
             mask=mask,
             strength=self.strength,
             inpaint=inpaint,
@@ -272,7 +274,7 @@ class Model(QObject, ObservableProperties):
                 params.seed,
                 client.models,
                 FileLibrary.instance(),
-                client.performance_settings,
+                self._performance_settings(client),
                 strength=params.strength,
                 upscale_factor=params.factor,
                 upscale=params.upscale,
@@ -294,10 +296,11 @@ class Model(QObject, ObservableProperties):
             return
 
         self.clear_error()
+        self.upscale.set_in_progress(True)
+
         eventloop.run(_report_errors(self, self._enqueue_job(job, inputs)))
 
         self._doc.resize(job.params.bounds.extent)
-        self.upscale.set_in_progress(True)
         self.upscale.target_extent_changed.emit(self.upscale.target_extent)
 
     def estimate_cost(self, kind=JobKind.diffusion):
@@ -359,7 +362,7 @@ class Model(QObject, ObservableProperties):
             self.seed,
             client.models,
             FileLibrary.instance(),
-            client.performance_settings,
+            self._performance_settings(client),
             mask=mask,
             strength=self.live.strength,
             inpaint=inpaint if mask else None,
@@ -437,7 +440,7 @@ class Model(QObject, ObservableProperties):
             image = self._doc.get_image(Bounds(0, 0, *self._doc.extent))
             mask, _ = self.document.create_mask_from_selection(padding=0.25, multiple=64)
             bounds = mask.bounds if mask else None
-            perf = self._connection.client.performance_settings
+            perf = self._performance_settings(self._connection.client)
             input = workflow.prepare_create_control_image(image, control.mode, perf, bounds)
             job = self.jobs.add_control(control, Bounds(0, 0, *image.extent))
         except Exception as e:
@@ -554,14 +557,13 @@ class Model(QObject, ObservableProperties):
             self._layer.hide()
 
     def apply_result(self, image: Image, params: JobParams, behavior: ApplyBehavior, prefix=""):
-        if image.extent != params.bounds.extent:
-            image = Image.crop(image, Bounds(0, 0, *params.bounds.extent))
+        bounds = Bounds(*params.bounds.offset, *image.extent)
         if len(params.regions) == 0:
             if behavior is ApplyBehavior.replace:
-                self.layers.update_layer_image(self.layers.active, image, params.bounds)
+                self.layers.update_layer_image(self.layers.active, image, bounds)
             else:
                 name = f"{prefix}{trim_text(params.name, 200)} ({params.seed})"
-                self.layers.create(name, image, params.bounds)
+                self.layers.create(name, image, bounds)
         else:  # apply to regions
             with RestoreActiveLayer(self.layers) as restore:
                 active_id = Region.link_target(self.layers.active).id_string
@@ -715,6 +717,24 @@ class Model(QObject, ObservableProperties):
             return InpaintMode.fill
         return self.inpaint.mode
 
+    def _performance_settings(self, client: Client):
+        result = client.performance_settings
+        if self.resolution_multiplier != 1.0:
+            result.resolution_multiplier = self.resolution_multiplier
+        return result
+
+    def try_set_preview_layer(self, uid: str):
+        if uid:
+            try:
+                self._layer = self.layers.find(QUuid(uid))
+            except Exception:
+                log.warning(f"Failed to set preview layer {uid}")
+                self._layer = None
+
+    @property
+    def preview_layer_id(self):
+        return self._layer.id_string if self._layer else ""
+
     @property
     def prompt_translation_language(self):
         return settings.prompt_translation if self.translation_enabled else ""
@@ -736,7 +756,7 @@ class Model(QObject, ObservableProperties):
         return self._doc
 
     @document.setter
-    def document(self, doc):
+    def document(self, doc: Document):
         # Note: for some reason Krita sometimes creates a new object for an existing document.
         # The old object is deleted and unusable. This method is used to update the object,
         # but doesn't actually change the document identity.
@@ -749,6 +769,10 @@ class Model(QObject, ObservableProperties):
     @property
     def layers(self):
         return self._doc.layers
+
+    @property
+    def name(self):
+        return Path(self._doc.filename).stem
 
 
 class InpaintContext(Enum):
@@ -858,7 +882,7 @@ class UpscaleWorkspace(QObject, ObservableProperties):
             self._update_can_generate()
 
     def _update_can_generate(self):
-        self.can_generate = not self._in_progress and (self.factor > 1.0 or self.use_diffusion)
+        self.can_generate = not self._in_progress
 
     @property
     def target_extent(self):
@@ -1118,7 +1142,7 @@ class AnimationWorkspace(QObject, ObservableProperties):
             conditioning,
             style=m.style,
             seed=seed,
-            perf=m._connection.client.performance_settings,
+            perf=m._performance_settings(m._connection.client),
             models=m._connection.client.models,
             files=FileLibrary.instance(),
             strength=m.strength,
