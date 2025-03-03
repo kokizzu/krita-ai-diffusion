@@ -129,6 +129,9 @@ def load_checkpoint_with_lora(w: ComfyWorkflow, checkpoint: CheckpointInput, mod
     if vae is None:
         vae = w.load_vae(models.for_arch(arch).vae)
 
+    if checkpoint.dynamic_caching and (arch in [Arch.flux, Arch.sd3] or arch.is_sdxl_like):
+        model = w.apply_first_block_cache(model, arch)
+
     for lora in checkpoint.loras:
         model, clip = w.load_lora(model, clip, lora.name, lora.strength, lora.strength)
 
@@ -798,6 +801,11 @@ def inpaint(
     target_bounds = params.target_bounds
     extent = ScaledExtent.from_input(images.extent)  # for initial generation with large context
 
+    is_inpaint_model = params.use_inpaint_model and models.control.find(ControlMode.inpaint) is None
+    if is_inpaint_model and models.arch is Arch.flux:
+        checkpoint.dynamic_caching = False  # doesn't seem to work with Flux fill model
+        sampling.cfg_scale = 30  # set Flux guidance to 30 (typical values don't work well)
+
     model, clip, vae = load_checkpoint_with_lora(w, checkpoint, models.all)
     model = w.differential_diffusion(model)
     model_orig = copy(model)
@@ -845,12 +853,10 @@ def inpaint(
         )
         inpaint_patch = w.load_fooocus_inpaint(**models.fooocus_inpaint)
         inpaint_model = w.apply_fooocus_inpaint(model, inpaint_patch, latent_inpaint)
-    elif params.use_inpaint_model and models.control.find(ControlMode.inpaint) is None:
+    elif is_inpaint_model:
         positive, negative, latent_inpaint, latent = w.vae_encode_inpaint_conditioning(
             vae, in_image, initial_mask, positive, negative
         )
-        if models.arch is Arch.flux:  # flux1-fill based model
-            sampling.cfg_scale = 30
         inpaint_model = model
     else:
         latent = w.vae_encode(vae, in_image)
@@ -1215,7 +1221,9 @@ def expand_custom(
             case "ETN_Parameter":
                 outputs[node.output(0)] = get_param(node)
             case "ETN_KritaImageLayer":
-                outputs[node.output(0)] = w.load_image(get_param(node, (Image, ImageCollection)))
+                img, mask = w.load_image_and_mask(get_param(node, (Image, ImageCollection)))
+                outputs[node.output(0)] = img
+                outputs[node.output(1)] = mask
             case "ETN_KritaMaskLayer":
                 outputs[node.output(0)] = w.load_mask(get_param(node, (Image, ImageCollection)))
             case "ETN_KritaStyle":
@@ -1279,6 +1287,7 @@ def prepare(
     i.models = style.get_models(models.checkpoints.keys())
     i.conditioning.positive += _collect_lora_triggers(i.models.loras, files)
     i.models.loras = unique(i.models.loras + extra_loras, key=lambda l: l.name)
+    i.models.dynamic_caching = perf.dynamic_caching
     arch = i.models.version = resolve_arch(style, models)
 
     _check_server_has_models(i.models, i.conditioning.regions, models, files, style.name)

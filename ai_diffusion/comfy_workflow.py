@@ -921,6 +921,20 @@ class ComfyWorkflow:
         assert result is not None
         return result
 
+    def load_image_and_mask(self, images: Image | ImageCollection):
+        assert self._run_mode is ComfyRunMode.server
+        if isinstance(images, Image):
+            return self.add("ETN_LoadImageBase64", 2, image=images.to_base64())
+        result = None
+        for image in images:
+            img, mask = self.add("ETN_LoadImageBase64", 2, image=image.to_base64())
+            if result:
+                result = (self.batch_image(result[0], img), self.batch_mask(result[1], mask))
+            else:
+                result = (img, mask)
+        assert result is not None
+        return result
+
     def send_image(self, image: Output):
         if self._run_mode is ComfyRunMode.runtime:
             return self.add("ETN_ReturnImage", 1, images=image)
@@ -983,6 +997,18 @@ class ComfyWorkflow:
             # use smaller model, but it requires onnxruntime, see #630
             mdls["bbox_detector"] = "yolo_nas_l_fp16.onnx"
         return self.add("DWPreprocessor", 1, image=image, resolution=resolution, **feat, **mdls)
+
+    def apply_first_block_cache(self, model: Output, arch: Arch):
+        return self.add(
+            "ApplyFBCacheOnModel",
+            1,
+            model=model,
+            object_to_patch="diffusion_model",
+            residual_diff_threshold=0.2 if arch.is_sdxl_like else 0.12,
+            start=0.0,
+            end=1.0,
+            max_consecutive_cache_hits=-1,
+        )
 
     def create_hook_lora(self, loras: list[tuple[str, float]]):
         key = "CreateHookLora" + str(loras)
