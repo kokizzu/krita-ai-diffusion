@@ -379,7 +379,7 @@ class ConnectionSettings(SettingsTab):
             basic = [m for lst in res.missing.values() for m in lst if m.arch is Arch.all]
             basic = util.unique(basic, key=lambda m: m.string)
             if len(basic) > 0:
-                text = _("Missing common models") + ":\n<ul>"
+                text = _("Missing common models (required)") + ":\n<ul>"
                 text += "\n".join((f"<li>{model_name(m, True)}</li>" for m in basic))
                 text += "</ul>"
             text += _("Detected base models:") + "\n<ul>"
@@ -390,8 +390,11 @@ class ConnectionSettings(SettingsTab):
                 if len(missing) == 0:
                     text += _("supported")
                 else:
-                    names = (model_name(m) for m in missing if m.arch is arch)
-                    text += _("missing") + " " + ", ".join(names)
+                    names = [model_name(m) for m in missing if m.arch is arch]
+                    if len(names) > 0:
+                        text += _("missing") + " " + ", ".join(names)
+                    else:
+                        text += _("models found")
                 text += "</li>"
             text += "</ul>"
 
@@ -589,6 +592,10 @@ class PerformanceSettings(SettingsTab):
         self._max_pixel_count.value_changed.connect(self.write)
         advanced_layout.addWidget(self._max_pixel_count)
 
+        self._dynamic_caching = SwitchSetting(Settings._dynamic_caching, parent=self)
+        self._dynamic_caching.value_changed.connect(self.write)
+        self._layout.addWidget(self._dynamic_caching)
+
         self._layout.addStretch()
 
     def _change_performance_preset(self, index):
@@ -603,12 +610,18 @@ class PerformanceSettings(SettingsTab):
         if not is_custom:
             self.read()
 
-    def update_device_info(self):
+    def update_client_info(self):
         if root.connection.state is ConnectionState.connected:
             client = root.connection.client
             self._device_info.setText(
                 _("Device")
                 + f": [{client.device_info.type.upper()}] {client.device_info.name} ({client.device_info.vram} GB)"
+            )
+            self._dynamic_caching.enabled = client.features.wave_speed
+            self._dynamic_caching.setToolTip(
+                _("The {node_name} node is not installed.").format(node_name="Comfy-WaveSpeed")
+                if not client.features.wave_speed
+                else ""
             )
 
     def _read(self):
@@ -622,7 +635,8 @@ class PerformanceSettings(SettingsTab):
         )
         self._resolution_multiplier.value = settings.resolution_multiplier
         self._max_pixel_count.value = settings.max_pixel_count
-        self.update_device_info()
+        self._dynamic_caching.value = settings.dynamic_caching
+        self.update_client_info()
 
     def _write(self):
         settings.history_size = self._history_size.value
@@ -633,6 +647,7 @@ class PerformanceSettings(SettingsTab):
         settings.performance_preset = list(PerformancePreset)[
             self._performance_preset.currentIndex()
         ]
+        settings.dynamic_caching = self._dynamic_caching.value
 
 
 class AboutSettings(SettingsTab):
@@ -897,7 +912,7 @@ class SettingsDialog(QDialog):
         self.connection.update_server_status()
         if root.connection.state == ConnectionState.connected:
             self.interface.update_translation(root.connection.client)
-            self.performance.update_device_info()
+            self.performance.update_client_info()
 
     def _open_settings_folder(self):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(util.user_data_dir)))
